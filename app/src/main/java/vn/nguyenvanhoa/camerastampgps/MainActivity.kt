@@ -66,8 +66,11 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -116,6 +119,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var mslAltitude: Double? = null
     private val altBusy = AtomicBoolean(false)
     private var geocodedAt: Location? = null
+    private var lastGeoAt = 0L
+    private val geoBusy = AtomicBoolean(false)
+    private val netExecutor = Executors.newSingleThreadExecutor()
 
     // Giờ GPS: độ lệch (ms) giữa giờ vệ tinh và giờ máy, cùng thời điểm đo
     @Volatile private var gpsOffsetMs: Long? = null
@@ -246,6 +252,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor.shutdown()
         geoExecutor.shutdown()
+        netExecutor.shutdown()
         tone?.release()
     }
 
@@ -579,9 +586,14 @@ class MainActivity : AppCompatActivity() {
         lastLocation = l
         updateMslAltitude(l)
         val g = geocodedAt
-        if (g == null || g.distanceTo(l) > 25f) {
-            geocodedAt = l
-            geocode(l)
+        val now = SystemClock.elapsedRealtime()
+        val moved = g?.distanceTo(l) ?: Float.MAX_VALUE
+        if (moved > 300f || (moved > 25f && now - lastGeoAt > 5000L)) {
+            if (geoBusy.compareAndSet(false, true)) {
+                geocodedAt = l
+                lastGeoAt = now
+                geocode(l)
+            }
         }
         refreshOverlay()
     }
@@ -608,47 +620,104 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Tra địa chỉ: Google Geocoder (xã/huyện/tỉnh) + tên đường.
+     * Khi Google không có tên đường hoặc xe đang chạy nhanh (> ~54 km/h, thường là cao tốc/quốc lộ),
+     * lấy tên đường từ OpenStreetMap (có tên cao tốc, quốc lộ, số hiệu CT/QL).
+     */
     private fun geocode(l: Location) {
-        if (!Geocoder.isPresent()) return
-        val geocoder = Geocoder(this, Locale("vi", "VN"))
-        if (Build.VERSION.SDK_INT >= 33) {
-            geocoder.getFromLocation(l.latitude, l.longitude, 1) { list ->
-                list.firstOrNull()?.let { a ->
-                    runOnUiThread { lastAddress = formatAddress(a); refreshOverlay() }
+        netExecutor.execute {
+            try {
+                var list: List<Address> = emptyList()
+                if (Geocoder.isPresent()) {
+                    try {
+                        @Suppress("DEPRECATION")
+                        list = Geocoder(this, Locale("vi", "VN"))
+                            .getFromLocation(l.latitude, l.longitude, 5) ?: emptyList()
+                    } catch (_: Exception) {
+                    }
                 }
-            }
-        } else {
-            geoExecutor.execute {
-                try {
-                    @Suppress("DEPRECATION")
-                    val a = geocoder.getFromLocation(l.latitude, l.longitude, 1)?.firstOrNull()
-                    if (a != null) runOnUiThread { lastAddress = formatAddress(a); refreshOverlay() }
-                } catch (_: Exception) {
-                    // Không có mạng: chỉ hiện tọa độ
+                var road = findRoad(list)
+                val fast = l.hasSpeed() && l.speed > 15f
+                if (road == null || fast) {
+                    osmRoad(l)?.let { road = it }
                 }
+                val addr = buildAddress(road, list.firstOrNull())
+                if (addr.isNotBlank()) runOnUiThread { lastAddress = addr; refreshOverlay() }
+            } catch (_: Exception) {
+                // Không có mạng: chỉ hiện tọa độ
+            } finally {
+                geoBusy.set(false)
             }
         }
     }
 
-    /** Bỏ mã Plus Code (VD "VVCC+MX2") và ghép địa chỉ từ đường, phường/xã, quận/huyện, tỉnh. */
-    private fun formatAddress(a: Address): String {
-        val plus = Regex("^[23456789CFGHJMPQRVWX]{2,8}\\+[23456789CFGHJMPQRVWX]{0,3}\\s*", RegexOption.IGNORE_CASE)
-        fun clean(s: String?) = s?.replace(plus, "")?.trim().orEmpty()
+    private val plusRe = Regex("^[23456789CFGHJMPQRVWX]{2,8}\\+[23456789CFGHJMPQRVWX]{0,3}\\s*", RegexOption.IGNORE_CASE)
+    private val roadRe = Regex(
+        "(cao tốc|quốc lộ|tỉnh lộ|đường|phố|đại lộ|xa lộ|cầu|hầm|QL\\s*\\d|ĐT\\s*\\d|CT\\.?\\s*\\d|AH\\s*\\d)",
+        RegexOption.IGNORE_CASE
+    )
 
-        val lineParts = (0..a.maxAddressLineIndex)
-            .flatMap { (a.getAddressLine(it) ?: "").split(",") }
-            .map { clean(it) }
-            .filter { it.isNotEmpty() }
+    private fun clean(s: String?) = s?.replace(plusRe, "")?.trim().orEmpty()
 
-        val street = listOf(clean(a.subThoroughfare), clean(a.thoroughfare))
-            .filter { it.isNotEmpty() }.joinToString(" ")
-        val compParts = listOf(
-            street, clean(a.subLocality), clean(a.locality),
-            clean(a.subAdminArea), clean(a.adminArea), clean(a.countryName)
-        ).filter { it.isNotEmpty() }
+    private fun findRoad(list: List<Address>): String? {
+        for (a in list) {
+            val t = clean(a.thoroughfare)
+            if (t.isNotEmpty()) return listOf(clean(a.subThoroughfare), t).filter { it.isNotEmpty() }.joinToString(" ")
+        }
+        for (a in list) {
+            val f = clean(a.featureName)
+            if (f.isNotEmpty() && roadRe.containsMatchIn(f)) return f
+        }
+        return null
+    }
 
-        val parts = if (compParts.size > lineParts.size) compParts else lineParts
-        return parts.distinct().joinToString(", ")
+    /** Ghép: tên đường, phường/xã, quận/huyện, tỉnh (bỏ Plus Code và "Việt Nam"). */
+    private fun buildAddress(road: String?, a: Address?): String {
+        val country = setOf("việt nam", "vietnam", "viet nam")
+        val admin = if (a == null) emptyList() else {
+            val comp = listOf(clean(a.subLocality), clean(a.locality), clean(a.subAdminArea), clean(a.adminArea))
+                .filter { it.isNotEmpty() }
+            comp.ifEmpty {
+                (0..a.maxAddressLineIndex)
+                    .flatMap { (a.getAddressLine(it) ?: "").split(",") }
+                    .map { clean(it) }
+                    .filter { it.isNotEmpty() }
+            }
+        }
+        val parts = mutableListOf<String>()
+        if (!road.isNullOrBlank()) parts += road
+        parts += admin
+        return parts.filter { it.lowercase() !in country }.distinct().joinToString(", ")
+    }
+
+    /** Tên đường từ OpenStreetMap (Nominatim). Gọi tối đa ~1 lần/5 giây. */
+    private fun osmRoad(l: Location): String? = try {
+        val url = URL(
+            String.format(
+                Locale.US,
+                "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=%.6f&lon=%.6f&zoom=17&namedetails=1&accept-language=vi",
+                l.latitude, l.longitude
+            )
+        )
+        val c = url.openConnection() as HttpURLConnection
+        c.setRequestProperty("User-Agent", "CameraStampGPS/1.3 (personal use)")
+        c.connectTimeout = 6000
+        c.readTimeout = 6000
+        val body = try { c.inputStream.bufferedReader().use { it.readText() } } finally { c.disconnect() }
+        val j = JSONObject(body)
+        val isRoad = j.optString("category") == "highway"
+        var name = j.optJSONObject("address")?.optString("road").orEmpty()
+        if (name.isEmpty() && isRoad) name = j.optString("name")
+        val ref = if (isRoad) j.optJSONObject("namedetails")?.optString("ref").orEmpty() else ""
+        when {
+            name.isEmpty() && ref.isEmpty() -> null
+            name.isEmpty() -> ref
+            ref.isEmpty() || name.contains(ref, ignoreCase = true) -> name
+            else -> "$name ($ref)"
+        }
+    } catch (_: Exception) {
+        null
     }
 
     private fun hasLocationPerm() =
