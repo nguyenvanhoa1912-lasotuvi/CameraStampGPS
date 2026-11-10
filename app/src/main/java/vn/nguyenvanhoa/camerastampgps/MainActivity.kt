@@ -1,0 +1,473 @@
+package vn.nguyenvanhoa.camerastampgps
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.location.Address
+import android.location.Geocoder
+import android.location.Location
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import android.view.OrientationEventListener
+import android.view.Surface
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var previewView: PreviewView
+    private lateinit var overlay: StampOverlayView
+    private lateinit var btnFlash: TextView
+    private lateinit var tvGps: TextView
+    private lateinit var thumb: ImageView
+    private lateinit var shutter: View
+
+    private var imageCapture: ImageCapture? = null
+    private var lensFacing = CameraSelector.LENS_FACING_BACK
+    private var flashMode = ImageCapture.FLASH_MODE_OFF
+    private lateinit var cameraExecutor: ExecutorService
+    private val geoExecutor = Executors.newSingleThreadExecutor()
+    private lateinit var fused: FusedLocationProviderClient
+    private lateinit var prefs: SharedPreferences
+    private val handler = Handler(Looper.getMainLooper())
+
+    @Volatile private var lastLocation: Location? = null
+    @Volatile private var lastAddress: String = ""
+    private var geocodedAt: Location? = null
+    private var logo: Bitmap? = null
+    private var lastSavedUri: Uri? = null
+    private var busy = false
+
+    private val permLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+            if (res[Manifest.permission.CAMERA] == true) startCamera()
+            else toast("Cần quyền Camera để chụp ảnh")
+            if (hasLocationPerm()) startLocation()
+            else toast("Chưa cấp quyền vị trí: ảnh sẽ không có tọa độ")
+        }
+
+    private val pickLogo =
+        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            if (uri != null) saveLogo(uri)
+        }
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            refreshOverlay()
+            handler.postDelayed(this, 1000L)
+        }
+    }
+
+    private val locCallback = object : LocationCallback() {
+        override fun onLocationResult(r: LocationResult) {
+            r.lastLocation?.let { onNewLocation(it) }
+        }
+    }
+
+    private val orientationListener by lazy {
+        object : OrientationEventListener(this) {
+            override fun onOrientationChanged(o: Int) {
+                if (o == ORIENTATION_UNKNOWN) return
+                val rot = when (o) {
+                    in 45 until 135 -> Surface.ROTATION_270
+                    in 135 until 225 -> Surface.ROTATION_180
+                    in 225 until 315 -> Surface.ROTATION_90
+                    else -> Surface.ROTATION_0
+                }
+                imageCapture?.targetRotation = rot
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        previewView = findViewById(R.id.previewView)
+        overlay = findViewById(R.id.overlay)
+        btnFlash = findViewById(R.id.btnFlash)
+        tvGps = findViewById(R.id.tvGps)
+        thumb = findViewById(R.id.thumb)
+        shutter = findViewById(R.id.shutter)
+
+        prefs = getSharedPreferences("stamp", MODE_PRIVATE)
+        cameraExecutor = Executors.newSingleThreadExecutor()
+        fused = LocationServices.getFusedLocationProviderClient(this)
+        loadLogo()
+
+        findViewById<View>(R.id.btnSettings).setOnClickListener { showSettings() }
+        btnFlash.setOnClickListener { toggleFlash() }
+        findViewById<View>(R.id.btnSwitch).setOnClickListener {
+            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+            startCamera()
+        }
+        shutter.setOnClickListener { takePhoto() }
+        thumb.setOnClickListener { openLast() }
+
+        val needed = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (needed.all { granted(it) }) startCamera() else permLauncher.launch(needed)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        orientationListener.enable()
+        handler.post(ticker)
+        if (hasLocationPerm()) startLocation()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        orientationListener.disable()
+        handler.removeCallbacks(ticker)
+        fused.removeLocationUpdates(locCallback)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        geoExecutor.shutdown()
+    }
+
+    // ---------------- Camera ----------------
+
+    private fun startCamera() {
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = future.get()
+            val preview = Preview.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .build()
+                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            imageCapture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setFlashMode(flashMode)
+                .build()
+            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+            try {
+                provider.unbindAll()
+                provider.bindToLifecycle(this, selector, preview, imageCapture)
+            } catch (e: Exception) {
+                toast("Không mở được camera: ${e.message}")
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun toggleFlash() {
+        flashMode = when (flashMode) {
+            ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
+            ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
+            else -> ImageCapture.FLASH_MODE_OFF
+        }
+        imageCapture?.flashMode = flashMode
+        btnFlash.text = when (flashMode) {
+            ImageCapture.FLASH_MODE_ON -> "⚡ Bật"
+            ImageCapture.FLASH_MODE_AUTO -> "⚡ Tự động"
+            else -> "⚡ Tắt"
+        }
+    }
+
+    private fun takePhoto() {
+        val ic = imageCapture ?: return
+        if (busy) return
+        busy = true
+        shutter.alpha = 0.4f
+        val data = currentStamp()
+        val logoSnap = logo
+
+        ic.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val rot = image.imageInfo.rotationDegrees
+                    val raw = image.use { it.toBitmap() }
+                    val stamped = StampRenderer.drawOnBitmap(rotate(raw, rot), data, logoSnap)
+                    val uri = saveToGallery(stamped, data)
+                    val tw = 240
+                    val th = max(1, (tw.toFloat() * stamped.height / stamped.width).toInt())
+                    val small = Bitmap.createScaledBitmap(stamped, tw, th, true)
+                    runOnUiThread {
+                        lastSavedUri = uri
+                        thumb.setImageBitmap(small)
+                        toast("Đã lưu: Pictures/CameraStampGPS")
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread { toast("Lỗi lưu ảnh: ${e.message}") }
+                } finally {
+                    runOnUiThread { busy = false; shutter.alpha = 1f }
+                }
+            }
+
+            override fun onError(e: ImageCaptureException) {
+                runOnUiThread {
+                    busy = false
+                    shutter.alpha = 1f
+                    toast("Lỗi chụp: ${e.message}")
+                }
+            }
+        })
+    }
+
+    private fun rotate(src: Bitmap, deg: Int): Bitmap {
+        if (deg == 0) return src
+        val m = Matrix().apply { postRotate(deg.toFloat()) }
+        val out = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+        if (out != src) src.recycle()
+        return out
+    }
+
+    private fun saveToGallery(bmp: Bitmap, d: StampData): Uri {
+        val name = "GPS_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(d.time) + ".jpg"
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_TAKEN, d.time.time)
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CameraStampGPS")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            } else {
+                val dir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                    "CameraStampGPS"
+                ).apply { mkdirs() }
+                put(MediaStore.Images.Media.DATA, File(dir, name).absolutePath)
+            }
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Không tạo được file ảnh")
+        contentResolver.openOutputStream(uri)?.use {
+            bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
+        } ?: throw IllegalStateException("Không ghi được file ảnh")
+
+        // Ghi EXIF: thời gian chụp + tọa độ GPS
+        try {
+            contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                val exif = ExifInterface(pfd.fileDescriptor)
+                val t = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(d.time)
+                exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, t)
+                exif.setAttribute(ExifInterface.TAG_DATETIME, t)
+                exif.setAttribute(ExifInterface.TAG_SOFTWARE, "CameraStampGPS")
+                d.location?.let { exif.setGpsInfo(it) }
+                exif.saveAttributes()
+            }
+        } catch (_: Exception) {
+            // EXIF không bắt buộc; dấu đã in trên ảnh
+        }
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+        }
+        return uri
+    }
+
+    private fun openLast() {
+        val uri = lastSavedUri ?: return toast("Chưa có ảnh vừa chụp")
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+        } catch (_: Exception) {
+            toast("Không mở được ứng dụng xem ảnh")
+        }
+    }
+
+    // ---------------- Vị trí ----------------
+
+    @SuppressLint("MissingPermission")
+    private fun startLocation() {
+        if (!hasLocationPerm()) return
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000L)
+            .setMinUpdateIntervalMillis(1000L)
+            .build()
+        fused.requestLocationUpdates(req, locCallback, Looper.getMainLooper())
+        fused.lastLocation.addOnSuccessListener { l ->
+            if (l != null && lastLocation == null) onNewLocation(l)
+        }
+    }
+
+    private fun onNewLocation(l: Location) {
+        lastLocation = l
+        val g = geocodedAt
+        if (g == null || g.distanceTo(l) > 25f) {
+            geocodedAt = l
+            geocode(l)
+        }
+        refreshOverlay()
+    }
+
+    private fun geocode(l: Location) {
+        if (!Geocoder.isPresent()) return
+        val geocoder = Geocoder(this, Locale("vi", "VN"))
+        if (Build.VERSION.SDK_INT >= 33) {
+            geocoder.getFromLocation(l.latitude, l.longitude, 1) { list ->
+                list.firstOrNull()?.let { a ->
+                    runOnUiThread { lastAddress = formatAddress(a); refreshOverlay() }
+                }
+            }
+        } else {
+            geoExecutor.execute {
+                try {
+                    @Suppress("DEPRECATION")
+                    val a = geocoder.getFromLocation(l.latitude, l.longitude, 1)?.firstOrNull()
+                    if (a != null) runOnUiThread { lastAddress = formatAddress(a); refreshOverlay() }
+                } catch (_: Exception) {
+                    // Không có mạng: chỉ hiện tọa độ
+                }
+            }
+        }
+    }
+
+    private fun formatAddress(a: Address): String =
+        (0..a.maxAddressLineIndex).joinToString(", ") { a.getAddressLine(it) }
+
+    private fun hasLocationPerm() =
+        granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+    private fun granted(p: String) =
+        ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
+
+    // ---------------- Dấu ----------------
+
+    private fun currentStamp() = StampData(
+        title = prefs.getString("title", "") ?: "",
+        note = prefs.getString("note", "") ?: "",
+        time = Date(),
+        location = lastLocation,
+        address = lastAddress
+    )
+
+    private fun refreshOverlay() {
+        overlay.update(currentStamp(), logo)
+        val l = lastLocation
+        tvGps.text = if (l == null) "GPS: đang dò..." else "GPS ±${l.accuracy.roundToInt()} m"
+    }
+
+    private fun showSettings() {
+        val pad = (18 * resources.displayMetrics.density).toInt()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+        }
+        val etTitle = EditText(this).apply {
+            hint = "VD: KFC Việt Nam – Kho lạnh"
+            setText(prefs.getString("title", ""))
+        }
+        val etNote = EditText(this).apply {
+            hint = "VD: Kiểm tra nhận hàng"
+            setText(prefs.getString("note", ""))
+        }
+        val btnLogo = Button(this).apply {
+            text = if (logo == null) "Chọn logo" else "Đổi logo"
+            setOnClickListener {
+                pickLogo.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
+        }
+        val btnRemove = Button(this).apply {
+            text = "Xóa logo"
+            setOnClickListener {
+                File(filesDir, "logo.png").delete()
+                logo = null
+                refreshOverlay()
+                toast("Đã xóa logo")
+            }
+        }
+        box.addView(TextView(this).apply { text = "Tên dấu / đơn vị" })
+        box.addView(etTitle)
+        box.addView(TextView(this).apply { text = "Ghi chú" })
+        box.addView(etNote)
+        box.addView(btnLogo)
+        box.addView(btnRemove)
+
+        AlertDialog.Builder(this)
+            .setTitle("Cài đặt dấu")
+            .setView(box)
+            .setPositiveButton("Lưu") { _, _ ->
+                prefs.edit()
+                    .putString("title", etTitle.text.toString().trim())
+                    .putString("note", etNote.text.toString().trim())
+                    .apply()
+                refreshOverlay()
+            }
+            .setNegativeButton("Hủy", null)
+            .show()
+    }
+
+    private fun saveLogo(uri: Uri) {
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (max(bounds.outWidth, bounds.outHeight) / sample > 1024) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                ?: return toast("Không đọc được ảnh logo")
+            FileOutputStream(File(filesDir, "logo.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            logo = bmp
+            refreshOverlay()
+            toast("Đã cập nhật logo")
+        } catch (e: Exception) {
+            toast("Lỗi logo: ${e.message}")
+        }
+    }
+
+    private fun loadLogo() {
+        val f = File(filesDir, "logo.png")
+        logo = if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+}
