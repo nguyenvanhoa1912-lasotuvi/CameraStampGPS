@@ -13,8 +13,8 @@ android {
         applicationId = "vn.nguyenvanhoa.camerastampgps"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     // Khóa ký cố định: mọi bản build có cùng chữ ký -> cài đè/cập nhật được

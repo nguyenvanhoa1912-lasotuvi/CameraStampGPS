@@ -10,6 +10,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.location.Address
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.location.Geocoder
 import android.location.Location
 import android.location.LocationListener
@@ -18,12 +20,17 @@ import android.location.altitude.AltitudeConverter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.CountDownTimer
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.view.GestureDetector
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.OrientationEventListener
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -42,6 +49,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
+import androidx.camera.core.Camera
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -64,6 +73,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -76,6 +86,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvGps: TextView
     private lateinit var thumb: ImageView
     private lateinit var shutter: View
+
+    private lateinit var btnTimer: TextView
+    private lateinit var tvCountdown: TextView
+    private lateinit var focusRing: View
+    private lateinit var sbExposure: SeekBar
+    private lateinit var tvExp: TextView
+    private lateinit var sbZoom: SeekBar
+    private lateinit var tvZoom: TextView
+
+    private var camera: Camera? = null
+    private var userZooming = false
+    private var timerSec = 0
+    private var countdown: CountDownTimer? = null
+    private var tone: ToneGenerator? = null
 
     private var imageCapture: ImageCapture? = null
     private var lensFacing = CameraSelector.LENS_FACING_BACK
@@ -165,6 +189,13 @@ class MainActivity : AppCompatActivity() {
         tvGps = findViewById(R.id.tvGps)
         thumb = findViewById(R.id.thumb)
         shutter = findViewById(R.id.shutter)
+        btnTimer = findViewById(R.id.btnTimer)
+        tvCountdown = findViewById(R.id.tvCountdown)
+        focusRing = findViewById(R.id.focusRing)
+        sbExposure = findViewById(R.id.sbExposure)
+        tvExp = findViewById(R.id.tvExp)
+        sbZoom = findViewById(R.id.sbZoom)
+        tvZoom = findViewById(R.id.tvZoom)
 
         prefs = getSharedPreferences("stamp", MODE_PRIVATE)
         options = loadOptions()
@@ -180,7 +211,11 @@ class MainActivity : AppCompatActivity() {
                 CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             startCamera()
         }
-        shutter.setOnClickListener { takePhoto() }
+        shutter.setOnClickListener { onShutter() }
+        timerSec = prefs.getInt("timer", 0)
+        updateTimerLabel()
+        btnTimer.setOnClickListener { cycleTimer() }
+        setupCameraControls()
         thumb.setOnClickListener { openLast() }
 
         val needed = arrayOf(
@@ -204,12 +239,23 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(ticker)
         fused.removeLocationUpdates(locCallback)
         try { locationManager.removeUpdates(gpsListener) } catch (_: Exception) {}
+        cancelCountdown()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
         geoExecutor.shutdown()
+        tone?.release()
+    }
+
+    /** Nút âm lượng = nút chụp. */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            if (event?.repeatCount == 0) onShutter()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     // ---------------- Camera ----------------
@@ -229,12 +275,161 @@ class MainActivity : AppCompatActivity() {
                 .build()
             val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
             try {
+                camera?.cameraInfo?.zoomState?.removeObservers(this)
                 provider.unbindAll()
-                provider.bindToLifecycle(this, selector, preview, imageCapture)
+                camera = provider.bindToLifecycle(this, selector, preview, imageCapture)
+                onCameraBound()
             } catch (e: Exception) {
                 toast("Không mở được camera: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    // ---------------- Độ sáng / Zoom / Lấy nét ----------------
+
+    private fun onCameraBound() {
+        val cam = camera ?: return
+        val es = cam.cameraInfo.exposureState
+        if (es.isExposureCompensationSupported) {
+            val r = es.exposureCompensationRange
+            sbExposure.isEnabled = true
+            sbExposure.min = r.lower
+            sbExposure.max = r.upper
+            sbExposure.progress = 0
+            cam.cameraControl.setExposureCompensationIndex(0)
+        } else {
+            sbExposure.isEnabled = false
+        }
+        updateExpLabel(0)
+        cam.cameraInfo.zoomState.observe(this) { z ->
+            tvZoom.text = String.format(Locale.US, "🔍 %.1fx", z.zoomRatio)
+            if (!userZooming) sbZoom.progress = (z.linearZoom * 100).roundToInt()
+        }
+    }
+
+    private fun updateExpLabel(index: Int) {
+        val step = camera?.cameraInfo?.exposureState?.exposureCompensationStep?.toFloat() ?: 0f
+        val ev = index * step
+        tvExp.text = if (index == 0) "☀ 0 EV" else String.format(Locale.US, "☀ %+.1f EV", ev)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupCameraControls() {
+        sbExposure.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                camera?.cameraControl?.setExposureCompensationIndex(p)
+                updateExpLabel(p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStopTrackingTouch(s: SeekBar) {}
+        })
+        findViewById<View>(R.id.btnExpReset).setOnClickListener {
+            sbExposure.progress = 0
+            camera?.cameraControl?.setExposureCompensationIndex(0)
+            updateExpLabel(0)
+        }
+
+        sbZoom.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                if (fromUser) camera?.cameraControl?.setLinearZoom(p / 100f)
+            }
+            override fun onStartTrackingTouch(s: SeekBar) { userZooming = true }
+            override fun onStopTrackingTouch(s: SeekBar) { userZooming = false }
+        })
+        findViewById<View>(R.id.btnZoomReset).setOnClickListener { camera?.cameraControl?.setZoomRatio(1f) }
+
+        val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val cam = camera ?: return false
+                val z = cam.cameraInfo.zoomState.value ?: return false
+                val target = (z.zoomRatio * detector.scaleFactor).coerceIn(z.minZoomRatio, z.maxZoomRatio)
+                cam.cameraControl.setZoomRatio(target)
+                return true
+            }
+        })
+        val tap = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                focusAt(e.x, e.y)
+                return true
+            }
+        })
+        previewView.setOnTouchListener { _, e ->
+            scale.onTouchEvent(e)
+            if (!scale.isInProgress && e.pointerCount == 1) tap.onTouchEvent(e)
+            true
+        }
+    }
+
+    private fun focusAt(x: Float, y: Float) {
+        val cam = camera ?: return
+        val point = previewView.meteringPointFactory.createPoint(x, y)
+        val action = FocusMeteringAction.Builder(
+            point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+        ).setAutoCancelDuration(5, TimeUnit.SECONDS).build()
+        cam.cameraControl.startFocusAndMetering(action)
+
+        focusRing.animate().cancel()
+        focusRing.x = x - focusRing.width / 2f
+        focusRing.y = y - focusRing.height / 2f
+        focusRing.alpha = 1f
+        focusRing.scaleX = 1.4f
+        focusRing.scaleY = 1.4f
+        focusRing.visibility = View.VISIBLE
+        focusRing.animate().scaleX(1f).scaleY(1f).setDuration(200).withEndAction {
+            focusRing.animate().alpha(0f).setStartDelay(1200).setDuration(400).start()
+        }.start()
+    }
+
+    // ---------------- Hẹn giờ chụp ----------------
+
+    private fun cycleTimer() {
+        timerSec = when (timerSec) { 0 -> 2; 2 -> 5; 5 -> 10; else -> 0 }
+        prefs.edit().putInt("timer", timerSec).apply()
+        updateTimerLabel()
+    }
+
+    private fun updateTimerLabel() {
+        btnTimer.text = if (timerSec == 0) "⏱ Tắt" else "⏱ ${timerSec}s"
+        btnTimer.setTextColor(if (timerSec == 0) 0xFFFFFFFF.toInt() else 0xFFFFC400.toInt())
+    }
+
+    private fun onShutter() {
+        if (countdown != null) {
+            cancelCountdown()
+            toast("Đã hủy hẹn giờ")
+            return
+        }
+        if (busy) return
+        if (timerSec == 0) { takePhoto(); return }
+        tvCountdown.visibility = View.VISIBLE
+        countdown = object : CountDownTimer(timerSec * 1000L, 1000L) {
+            override fun onTick(ms: Long) {
+                tvCountdown.text = ((ms + 999) / 1000).toString()
+                beep(false)
+            }
+            override fun onFinish() {
+                countdown = null
+                tvCountdown.visibility = View.GONE
+                beep(true)
+                takePhoto()
+            }
+        }.start()
+    }
+
+    private fun cancelCountdown() {
+        countdown?.cancel()
+        countdown = null
+        tvCountdown.visibility = View.GONE
+    }
+
+    private fun beep(last: Boolean) {
+        try {
+            if (tone == null) tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70)
+            tone?.startTone(if (last) ToneGenerator.TONE_PROP_BEEP2 else ToneGenerator.TONE_PROP_BEEP, 120)
+        } catch (_: Exception) {
+        }
     }
 
     private fun toggleFlash() {
