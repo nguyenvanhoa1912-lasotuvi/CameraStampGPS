@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val ksPass: String? = System.getenv("KEYSTORE_PASSWORD")
+
 android {
     namespace = "vn.nguyenvanhoa.camerastampgps"
     compileSdk = 34
@@ -15,11 +17,21 @@ android {
         versionName = "1.1"
     }
 
+    // Khóa ký cố định: mọi bản build có cùng chữ ký -> cài đè/cập nhật được
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file("keystore/camerastampgps.jks")
+            storePassword = ksPass
+            keyAlias = "camerastampgps"
+            keyPassword = ksPass
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Dùng cá nhân: ký bằng khóa debug để cài trực tiếp
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (!ksPass.isNullOrBlank()) signingConfigs.getByName("release")
+            else signingConfigs.getByName("debug")
         }
     }
     compileOptions {
