@@ -12,24 +12,32 @@ import android.graphics.Matrix
 import android.location.Address
 import android.location.Geocoder
 import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.location.altitude.AltitudeConverter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.OrientationEventListener
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
+import androidx.annotation.RequiresApi
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -56,6 +64,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -74,12 +83,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private val geoExecutor = Executors.newSingleThreadExecutor()
     private lateinit var fused: FusedLocationProviderClient
+    private lateinit var locationManager: LocationManager
     private lateinit var prefs: SharedPreferences
     private val handler = Handler(Looper.getMainLooper())
 
     @Volatile private var lastLocation: Location? = null
     @Volatile private var lastAddress: String = ""
+    @Volatile private var mslAltitude: Double? = null
+    private val altBusy = AtomicBoolean(false)
     private var geocodedAt: Location? = null
+
+    // Giờ GPS: độ lệch (ms) giữa giờ vệ tinh và giờ máy, cùng thời điểm đo
+    @Volatile private var gpsOffsetMs: Long? = null
+    @Volatile private var gpsOffsetAt: Long = 0L
+
+    private var options = StampOptions()
     private var logo: Bitmap? = null
     private var lastSavedUri: Uri? = null
     private var busy = false
@@ -110,6 +128,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Nhận vị trí trực tiếp từ chip GPS để lấy giờ vệ tinh (UTC). */
+    private val gpsListener = object : LocationListener {
+        override fun onLocationChanged(l: Location) {
+            val ageMs = (SystemClock.elapsedRealtimeNanos() - l.elapsedRealtimeNanos) / 1_000_000L
+            gpsOffsetMs = l.time + ageMs - System.currentTimeMillis()
+            gpsOffsetAt = SystemClock.elapsedRealtime()
+        }
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
     private val orientationListener by lazy {
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -138,8 +167,10 @@ class MainActivity : AppCompatActivity() {
         shutter = findViewById(R.id.shutter)
 
         prefs = getSharedPreferences("stamp", MODE_PRIVATE)
+        options = loadOptions()
         cameraExecutor = Executors.newSingleThreadExecutor()
         fused = LocationServices.getFusedLocationProviderClient(this)
+        locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
         loadLogo()
 
         findViewById<View>(R.id.btnSettings).setOnClickListener { showSettings() }
@@ -172,6 +203,7 @@ class MainActivity : AppCompatActivity() {
         orientationListener.disable()
         handler.removeCallbacks(ticker)
         fused.removeLocationUpdates(locCallback)
+        try { locationManager.removeUpdates(gpsListener) } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
@@ -290,7 +322,7 @@ class MainActivity : AppCompatActivity() {
             bmp.compress(Bitmap.CompressFormat.JPEG, 92, it)
         } ?: throw IllegalStateException("Không ghi được file ảnh")
 
-        // Ghi EXIF: thời gian chụp + tọa độ GPS
+        // EXIF: thời gian chụp + tọa độ GPS
         try {
             contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
                 val exif = ExifInterface(pfd.fileDescriptor)
@@ -337,16 +369,48 @@ class MainActivity : AppCompatActivity() {
         fused.lastLocation.addOnSuccessListener { l ->
             if (l != null && lastLocation == null) onNewLocation(l)
         }
+        if (granted(Manifest.permission.ACCESS_FINE_LOCATION)) {
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER, 1000L, 0f, gpsListener, Looper.getMainLooper()
+                )
+            } catch (_: Exception) {
+                // Máy không có GPS provider: bỏ qua giờ vệ tinh
+            }
+        }
     }
 
     private fun onNewLocation(l: Location) {
         lastLocation = l
+        updateMslAltitude(l)
         val g = geocodedAt
         if (g == null || g.distanceTo(l) > 25f) {
             geocodedAt = l
             geocode(l)
         }
         refreshOverlay()
+    }
+
+    /** Độ cao so với mực nước biển. Android 14+ mới có; máy cũ trả về null (ẩn dòng độ cao). */
+    private fun updateMslAltitude(l: Location) {
+        if (Build.VERSION.SDK_INT < 34) { mslAltitude = null; return }
+        updateMslAltitude34(l)
+    }
+
+    @RequiresApi(34)
+    private fun updateMslAltitude34(l: Location) {
+        if (l.hasMslAltitude()) { mslAltitude = l.mslAltitudeMeters; return }
+        if (!l.hasAltitude() || !altBusy.compareAndSet(false, true)) return
+        val copy = Location(l)
+        geoExecutor.execute {
+            try {
+                AltitudeConverter().addMslAltitudeToLocation(this, copy)
+                if (copy.hasMslAltitude()) mslAltitude = copy.mslAltitudeMeters
+            } catch (_: Exception) {
+            } finally {
+                altBusy.set(false)
+            }
+        }
     }
 
     private fun geocode(l: Location) {
@@ -371,8 +435,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun formatAddress(a: Address): String =
-        (0..a.maxAddressLineIndex).joinToString(", ") { a.getAddressLine(it) }
+    /** Bỏ mã Plus Code (VD "VVCC+MX2") và ghép địa chỉ từ đường, phường/xã, quận/huyện, tỉnh. */
+    private fun formatAddress(a: Address): String {
+        val plus = Regex("^[23456789CFGHJMPQRVWX]{2,8}\\+[23456789CFGHJMPQRVWX]{0,3}\\s*", RegexOption.IGNORE_CASE)
+        fun clean(s: String?) = s?.replace(plus, "")?.trim().orEmpty()
+
+        val lineParts = (0..a.maxAddressLineIndex)
+            .flatMap { (a.getAddressLine(it) ?: "").split(",") }
+            .map { clean(it) }
+            .filter { it.isNotEmpty() }
+
+        val street = listOf(clean(a.subThoroughfare), clean(a.thoroughfare))
+            .filter { it.isNotEmpty() }.joinToString(" ")
+        val compParts = listOf(
+            street, clean(a.subLocality), clean(a.locality),
+            clean(a.subAdminArea), clean(a.adminArea), clean(a.countryName)
+        ).filter { it.isNotEmpty() }
+
+        val parts = if (compParts.size > lineParts.size) compParts else lineParts
+        return parts.distinct().joinToString(", ")
+    }
 
     private fun hasLocationPerm() =
         granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION)
@@ -382,13 +464,25 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- Dấu ----------------
 
-    private fun currentStamp() = StampData(
-        title = prefs.getString("title", "") ?: "",
-        note = prefs.getString("note", "") ?: "",
-        time = Date(),
-        location = lastLocation,
-        address = lastAddress
-    )
+    private fun currentGpsTime(now: Long): Date? {
+        val off = gpsOffsetMs ?: return null
+        if (SystemClock.elapsedRealtime() - gpsOffsetAt > 60_000L) return null   // mất tín hiệu GPS > 60 giây
+        return Date(now + off)
+    }
+
+    private fun currentStamp(): StampData {
+        val now = System.currentTimeMillis()
+        return StampData(
+            title = prefs.getString("title", "") ?: "",
+            note = prefs.getString("note", "") ?: "",
+            time = Date(now),
+            location = lastLocation,
+            address = lastAddress,
+            mslAltitude = mslAltitude,
+            gpsTime = currentGpsTime(now),
+            options = options
+        )
+    }
 
     private fun refreshOverlay() {
         overlay.update(currentStamp(), logo)
@@ -396,12 +490,34 @@ class MainActivity : AppCompatActivity() {
         tvGps.text = if (l == null) "GPS: đang dò..." else "GPS ±${l.accuracy.roundToInt()} m"
     }
 
+    private fun loadOptions() = StampOptions(
+        showAddress = prefs.getBoolean("showAddress", true),
+        showCoords = prefs.getBoolean("showCoords", true),
+        showAltitude = prefs.getBoolean("showAltitude", true),
+        showGpsTime = prefs.getBoolean("showGpsTime", true),
+        showNote = prefs.getBoolean("showNote", true),
+        showLogo = prefs.getBoolean("showLogo", true),
+        sizePct = prefs.getInt("sizePct", 100),
+        bgOpacityPct = prefs.getInt("bgPct", 65)
+    )
+
     private fun showSettings() {
-        val pad = (18 * resources.displayMetrics.density).toInt()
+        val dp = resources.displayMetrics.density
+        val pad = (18 * dp).toInt()
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad / 2, pad, 0)
+            setPadding(pad, pad / 2, pad, pad / 2)
         }
+        val scroll = ScrollView(this).apply { addView(box) }
+
+        fun header(t: String) = TextView(this).apply {
+            text = t
+            textSize = 15f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(0xFFFFC400.toInt())
+            setPadding(0, (12 * dp).toInt(), 0, (4 * dp).toInt())
+        }
+
         val etTitle = EditText(this).apply {
             hint = "VD: KFC Việt Nam – Kho lạnh"
             setText(prefs.getString("title", ""))
@@ -410,6 +526,35 @@ class MainActivity : AppCompatActivity() {
             hint = "VD: Kiểm tra nhận hàng"
             setText(prefs.getString("note", ""))
         }
+
+        val toggles = listOf(
+            "showAddress" to "Địa chỉ",
+            "showCoords" to "Tọa độ & sai số",
+            "showAltitude" to "Độ cao (mực nước biển, Android 14+)",
+            "showGpsTime" to "Giờ vệ tinh GPS",
+            "showNote" to "Ghi chú",
+            "showLogo" to "Logo"
+        ).map { (key, label) ->
+            key to CheckBox(this).apply { text = label; isChecked = prefs.getBoolean(key, true) }
+        }
+
+        fun slider(label: String, min: Int, max: Int, value: Int): Pair<TextView, SeekBar> {
+            val tv = TextView(this).apply { text = "$label: $value%" }
+            val sb = SeekBar(this).apply {
+                this.min = min
+                this.max = max
+                progress = value
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { tv.text = "$label: $p%" }
+                    override fun onStartTrackingTouch(s: SeekBar) {}
+                    override fun onStopTrackingTouch(s: SeekBar) {}
+                })
+            }
+            return tv to sb
+        }
+        val (tvSize, sbSize) = slider("Cỡ dấu", 50, 150, prefs.getInt("sizePct", 100))
+        val (tvBg, sbBg) = slider("Độ đậm nền", 20, 95, prefs.getInt("bgPct", 65))
+
         val btnLogo = Button(this).apply {
             text = if (logo == null) "Chọn logo" else "Đổi logo"
             setOnClickListener {
@@ -425,21 +570,40 @@ class MainActivity : AppCompatActivity() {
                 toast("Đã xóa logo")
             }
         }
+
+        box.addView(header("Nội dung"))
         box.addView(TextView(this).apply { text = "Tên dấu / đơn vị" })
         box.addView(etTitle)
         box.addView(TextView(this).apply { text = "Ghi chú" })
         box.addView(etNote)
+        box.addView(header("Hiển thị trên dấu"))
+        toggles.forEach { box.addView(it.second) }
+        box.addView(header("Kích thước & nền"))
+        box.addView(tvSize); box.addView(sbSize)
+        box.addView(tvBg); box.addView(sbBg)
+        box.addView(header("Logo"))
         box.addView(btnLogo)
         box.addView(btnRemove)
 
         AlertDialog.Builder(this)
             .setTitle("Cài đặt dấu")
-            .setView(box)
+            .setView(scroll)
             .setPositiveButton("Lưu") { _, _ ->
-                prefs.edit()
+                val e = prefs.edit()
                     .putString("title", etTitle.text.toString().trim())
                     .putString("note", etNote.text.toString().trim())
-                    .apply()
+                    .putInt("sizePct", sbSize.progress)
+                    .putInt("bgPct", sbBg.progress)
+                toggles.forEach { (k, cb) -> e.putBoolean(k, cb.isChecked) }
+                e.apply()
+                options = loadOptions()
+                refreshOverlay()
+            }
+            .setNeutralButton("Mặc định") { _, _ ->
+                val e = prefs.edit().putInt("sizePct", 100).putInt("bgPct", 65)
+                toggles.forEach { (k, _) -> e.putBoolean(k, true) }
+                e.apply()
+                options = loadOptions()
                 refreshOverlay()
             }
             .setNegativeButton("Hủy", null)
